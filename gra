@@ -1,0 +1,242 @@
+#!/usr/bin/env sh
+
+# Wrapper script to play content in RetroArch without an explicit --libretro
+# argument.
+#
+# Maybe one day I'll dig into the RetroArch source code and implement it
+# properly in C.
+#
+#
+# License: public domain
+# Usage: gra [rom-file] [options]
+
+# Don't go into an infinite loop if $RETROARCH is set to the current script.
+if [ -n "$RETROARCH" ] && [ $(basename $RETROARCH) = $(basename $0) ];
+then
+    unset RETROARCH
+fi
+
+# Try to guess the defaults for each system.  These can be overridden by
+# environment variables.
+case $(uname -s | tr '[:upper:]' '[:lower:]') in
+    darwin)
+        [ -n "$rainstdir" ] || rainstdir=/Applications/RetroArch.app
+        [ -n "$RETROARCH" ] || RETROARCH=$rainstdir/RetroArch
+        [ -n "$sharedext" ] || sharedext=dylib
+        radir=$rainstdir/Contents/Resources
+        ;;
+    mingw*)
+        pathsep=\;
+        # Try to get the installation directory
+        radir=$(dirname "$(reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RetroArch /v UninstallString | \
+            tail -n 2 | head -n 1 | \
+            sed -e 's/^\s\+UninstallString\s\+REG_SZ\s\+\(.*\)\r$/\1/g')")
+        # If that fails, default
+        [ -n "$radir" ] || radir="$APPDATA\\RetroArch"
+        [ -n "$RETROARCH" ] || RETROARCH="$radir\\retroarch.exe"
+        [ -n "$sharedext" ] || sharedext=dll
+        ;;
+    *)
+        [ -n "$RETROARCH" ] || RETROARCH=retroarch
+        if [ -d ${XDG_CONFIG_HOME:=~/.config} ];
+        then
+            radir=$XDG_CONFIG_HOME/retroarch
+        else
+            radir=~/.retroarch
+        fi
+        [ -n "$sharedext" ] || sharedext=so
+        ;;
+esac
+
+if [ -n "$LIBRETRO_DIRECTORY" ];
+then
+    coresdir="$LIBRETRO_DIRETORY";
+    infodir="$coresdir";
+fi
+
+[ -n "$coresdir" ] || coresdir="$radir/cores"
+[ -n "$infodir" ] || infodir="$radir/cores"
+[ -n "$pathsep" ] || pathsep=:
+
+auto_select_core=0
+if [ "$1" = "-a" ];
+then
+    auto_select_core=1
+    shift
+fi
+
+if [ $# -ge 1 ];
+then
+    romfile="$1"
+    shift
+    opts="$@"
+fi
+
+# Automatically enable some features for certain shells
+if [ -n "$BASH_VERSION" ];
+then
+    SUPPORTS_ARRAYS=1
+elif [ -n "$KSH_VERSION" ] || KSH_VERSION=$(eval 'echo ${.sh.version}' 2>/dev/null);
+then
+    SUPPORTS_ARRAYS=1
+elif [ -n "$ZSH_VERSION" ];
+then
+    SUPPORTS_ARRAYS=1
+    # Needed to split the list of supported extensions in a POSIX-compliant
+    # manner.
+    set -o shwordsplit
+fi
+
+# Future i18n support
+_()
+{
+    if which gettext.sh >/dev/null 2>&1;
+    then
+        . gettext.sh
+        export TEXTDOMAIN=gra
+        export TEXTDOMAINDIR=$(dirname $0)/../share/locale
+        eval_gettext "$1"
+    else
+        printf "$1"
+    fi
+}
+
+# See if a supported file is in the (7)zip archive.
+check_archive()
+{
+    file="$1"
+    pat="$2"
+
+    case "$file" in
+        *.7z)
+            7z l "$file" | grep -iq "$pat"
+            ;;
+        *.gz|*.rar|*.RAR)
+            (_ "Obsolete compression format. Use 7zip instead." && echo) >&2
+            exit 1
+            ;;
+        *.zip|*.ZIP)
+            unzip -l "$file" | grep -iq "$pat"
+            ;;
+        *)
+            false
+            ;;
+    esac
+}
+
+find_cores()
+{
+    for core in "$coresdir"/*.$sharedext;
+    do
+        info_name=$(basename ${core%.$sharedext}.info)
+
+        if [ -f "$infodir/$info_name" ];
+        then
+            display_name=$(get_setting display_name "$infodir/$info_name")
+            supported_extensions=$(get_setting supported_extensions "$infodir/$info_name")
+
+            old_ifs=$IFS
+            IFS='|'
+            for ext in $supported_extensions;
+            do
+                # Known bug: matches compressed files, so it can return false
+                # positives for cores with built-in zip/7z support.  When the
+                # core_path is DETECT in the playlists, RetroArch's UI does the
+                # same thing, so there's probably no point to fix this.
+                if check_archive "$romfile" "$ext$" || echo "$romfile" | grep -iq "\.$ext$";
+                then
+                    if [ -n "$SUPPORTS_ARRAYS" ];
+                    then
+                        cores[$((${#cores[*]} + 1))]=$core
+                        core_names[$((${#core_names[*]} + 1))]=${display_name:-$core}
+                    else
+                        [ -n "$cores" ] && cores="$cores$pathsep$core" || cores="$core"
+                    fi
+                fi
+            done
+            IFS=$old_ifs
+        fi
+    done
+}
+
+get_setting()
+{
+    setting_name=$1
+    [ -n "$2" ] && settings_file=$2 || settings_file=$radir/retroarch.cfg
+    grep $setting_name "$settings_file" | sed -e 's/^.\+"\([^"]\+\)".*$/\1/'
+}
+
+select_core()
+{
+    i=0
+    if ([ -n "$SUPPORTS_ARRAYS" ] && [ ${#cores[*]} -gt 1 ]) || [ -n "$cores" ];
+    then
+        [ $auto_select_core -eq 0 ] &&_ "SUGGESTED CORES:" && echo
+
+        if [ -n "$SUPPORTS_ARRAYS" ];
+        then
+            while [ $i -lt ${#cores[*]} ];
+            do
+                i=$(($i + 1))
+                if [ $auto_select_core -eq 0 ];
+                then
+                    printf "$i) %s\n" "${core_names[$i]}"
+                fi
+            done
+        else
+            oldifs=$IFS
+            IFS=$pathsep
+            for core in $cores;
+            do
+                i=$(expr $i + 1)
+                if [ $auto_select_core -eq 0 ];
+                then
+                    echo "$i) $(basename $core)"
+                fi
+            done
+            IFS=$oldifs
+        fi
+    fi
+
+    if [ $i -gt 1 ];
+    then
+        if [ $auto_select_core -ne 0 ];
+        then
+           [ -n "$RANDOM" ] || RANDOM=1
+           sel_core=$(($RANDOM % i))
+        else
+            printf "${PS3-#? }"
+            read -r sel_core 0<&3
+        fi
+    fi
+    [ -n "$sel_core" ] || sel_core=1
+
+    if [ $sel_core -ge 1 ] 2>/dev/null;
+    then
+        if [ -n "$SUPPORTS_ARRAYS" ];
+        then
+            [ $sel_core -le ${#cores[*]} ] && sel_core_name="${cores[$sel_core]}"
+        else
+            [ $sel_core -le $i ] && sel_core_name="$(echo $cores | cut -d $pathsep -f $sel_core)"
+        fi
+
+        $RETROARCH -L $sel_core_name $opts "$romfile" && return 0
+    elif [ "$sel_core" = "0" ];
+    then
+        # Canceled
+        return 0
+    fi
+
+    return 1
+}
+
+# If the first argument is something other than a file, pass the arguments
+# directly to $RETROARCH rather than trying to find a suitable core.
+if [ ! -f "$romfile" ];
+then
+    $RETROARCH "$@"
+else
+    exec 3<&0
+    find_cores
+    select_core
+fi
